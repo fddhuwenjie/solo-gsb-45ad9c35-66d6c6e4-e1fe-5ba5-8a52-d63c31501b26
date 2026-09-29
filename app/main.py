@@ -37,6 +37,13 @@
   键，只读取 (起点, 终点] 且始终沿用终点水位（并发新增留到下一轮），
   末页返回 resume_cursor 续拉增量，空轮也推进水位；游标版本、结构、范围
   错误或跨文档使用返回 422；事件载荷只保留行落库时的稳定业务字段。
+- 文档批注覆盖图：指定文档版本，在同一个 SQLite 读事务中读取该版全文与
+  全部迁移位置，把 [0, 文本码点长度) 划分为连续、无重叠的最大片段；
+  resolved / confirmed 范围计入 definite，未确认且非顺延的 ambiguous
+  候选先按批注合并重叠候选再计入 possible（同一 ID 不重复），
+  unresolved、顺延占位与该版尚不存在的批注列入 exclusions 并说明原因；
+  片段状态为 covered / uncertain / uncovered，结果无缝覆盖全文、
+  相同快照字节一致，接口只读、不写入数据。
 """
 from __future__ import annotations
 
@@ -49,6 +56,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import archive as archive_mod
+from . import coverage as coverage_mod
 from . import db
 from . import events as events_mod
 from . import gate as gate_mod
@@ -60,6 +68,7 @@ from .diffing import (
 )
 from .matching import locate
 from .redacting import EffectiveRange, build_redaction, merge_ranges
+from .coverage import CoverageRange, build_coverage, merge_candidate_ranges
 from .review import (
     build_prereq_map,
     find_cycle_path,
@@ -87,7 +96,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -100,7 +109,10 @@ app = FastAPI(
         "以及批注驱动的脱敏副本：同一读事务读取版本与生效位置，"
         "重叠或首尾相接的范围合并替换，返回脱敏全文与码点区间映射；"
         "以及文档增量事件流：六类只追加记录稳定合并，以水位向量 + "
-        "续页 / 续拉游标分页，窗口内不漏、不重、不乱序。"
+        "续页 / 续拉游标分页，窗口内不漏、不重、不乱序；"
+        "以及文档批注覆盖图：同一读事务读取版本全文与全部迁移位置，"
+        "按 definite / possible 划分无缝覆盖全文的最大片段，"
+        "不可用批注列入 exclusions 并说明原因。"
     ),
     lifespan=lifespan,
 )
@@ -242,7 +254,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -1029,6 +1041,163 @@ def create_redaction(
         "redacted_interval_count": len(intervals),
         "fragments": result["fragments"],
         "placeholders": result["placeholders"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 文档批注覆盖图
+# ---------------------------------------------------------------------------
+
+
+def _coverage_exclusion(
+    annotation_id: int,
+    reason: str,
+    message: str,
+    status: Optional[str],
+    carried_from: Optional[int],
+) -> dict:
+    item = {
+        "annotation_id": annotation_id,
+        "status": status,
+        "reason": reason,
+        "message": message,
+    }
+    if carried_from is not None:
+        item["carried_from_location_id"] = carried_from
+    return item
+
+
+@app.get("/documents/{document_id}/coverage")
+def document_coverage(
+    document_id: int,
+    version: int = Query(..., ge=1, description="目标文档版本号"),
+    con=Depends(get_db),
+):
+    """生成指定文档版本的批注覆盖图（只读，不写入任何数据）。
+
+    在**同一个 SQLite 读事务**（同一快照）中读取该版本全文与文档下全部
+    批注在该版上的迁移记录，把码点区间 ``[0, len(content))`` 划分为
+    连续、无重叠的**最大片段**：
+
+    - ``resolved`` / 人工确认 ``confirmed`` 的生效范围计入 **definite**
+      （确认以确认范围为准）；
+    - 未确认且非顺延的 ``ambiguous``：其全部候选范围先**按批注**把严格
+      重叠的候选合并为连续最大区间，再计入 **possible**——同一批注的
+      possible 区间两两不相交，扫描线不会对同一 ID 重复计数；
+    - **exclusions** 收录不提供任何覆盖范围的批注并逐条说明原因：
+      ``unresolved``（选区在该版没有精确落点）、
+      ``ambiguous_carried_forward``（歧义顺延占位，原始歧义未经人工确认）、
+      ``location_missing``（该版尚无此批注的迁移记录，如批注创建于更晚版本）。
+
+    每个片段返回 ``start`` / ``end`` / ``text``、升序的
+    ``definite_ids`` / ``possible_ids`` 与 ``status``：含 definite 为
+    ``covered``，仅含 possible 为 ``uncertain``，均空为 ``uncovered``。
+    相邻片段仅在状态与两组 ID 完全相同时合并，结果首尾相接、**无缝覆盖
+    全文**（空文本以一个零长度 ``uncovered`` 片段覆盖 ``[0, 0)``）。
+    相同快照下响应序列化结果**字节一致**。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        version_row = _get_version(con, document_id, version)
+        text = version_row["content"]
+
+        ann_rows = con.execute(
+            "SELECT * FROM annotations WHERE document_id = ? ORDER BY id",
+            (document_id,),
+        ).fetchall()
+        loc_rows = con.execute(
+            "SELECT * FROM locations WHERE version_id = ? ORDER BY annotation_id",
+            (version_row["id"],),
+        ).fetchall()
+        locations_by_ann = {row["annotation_id"]: row for row in loc_rows}
+        # 该版全部迁移记录的人工确认（每个 location 至多一条；同一读事务快照）
+        confirmations = con.execute(
+            """
+            SELECT c.* FROM confirmations c
+            JOIN locations l ON l.id = c.location_id
+            WHERE l.version_id = ?
+            """,
+            (version_row["id"],),
+        ).fetchall()
+        confirmation_by_loc = {row["location_id"]: row for row in confirmations}
+
+        definite_ranges: list = []
+        possible_ranges: list = []
+        exclusions: list = []
+        for ann in ann_rows:
+            aid = ann["id"]
+            loc = locations_by_ann.get(aid)
+            if loc is None:
+                exclusions.append(
+                    _coverage_exclusion(
+                        aid,
+                        "location_missing",
+                        f"批注 {aid} 在第 {version} 版没有迁移记录"
+                        "（该批注创建于更晚版本），该版不存在其覆盖位置",
+                        None,
+                        None,
+                    )
+                )
+                continue
+
+            conf = confirmation_by_loc.get(loc["id"])
+            if conf is not None:
+                status, start, end = "confirmed", conf["start"], conf["end"]
+            else:
+                status, start, end = loc["status"], loc["start"], loc["end"]
+
+            if status in ("resolved", "confirmed"):
+                definite_ranges.append(CoverageRange(aid, start, end))
+            elif status == "ambiguous":
+                if loc["carried_from"] is not None:
+                    exclusions.append(
+                        _coverage_exclusion(
+                            aid,
+                            "ambiguous_carried_forward",
+                            f"批注 {aid} 在第 {version} 版为歧义顺延占位记录"
+                            "（原始歧义未经人工确认，本版未参与自动迁移），"
+                            "不提供覆盖范围",
+                            "ambiguous",
+                            loc["carried_from"],
+                        )
+                    )
+                else:
+                    candidates = json.loads(loc["candidates"])
+                    merged = merge_candidate_ranges(
+                        [(c["start"], c["end"]) for c in candidates]
+                    )
+                    for cand_start, cand_end in merged:
+                        possible_ranges.append(
+                            CoverageRange(aid, cand_start, cand_end)
+                        )
+            else:  # unresolved
+                exclusions.append(
+                    _coverage_exclusion(
+                        aid,
+                        "unresolved",
+                        f"批注 {aid} 在第 {version} 版未解析"
+                        "（选区在该版没有精确落点），不提供覆盖范围",
+                        "unresolved",
+                        None,
+                    )
+                )
+
+        result = build_coverage(text, definite_ranges, possible_ranges)
+
+    return {
+        "document_id": document_id,
+        "version_number": version_row["number"],
+        "source_length": result["source_length"],
+        "segment_count": result["segment_count"],
+        "summary": {
+            **result["summary"],
+            "definite_annotation_count": len({r.annotation_id for r in definite_ranges}),
+            "possible_annotation_count": len({r.annotation_id for r in possible_ranges}),
+            "excluded_annotation_count": len(exclusions),
+            "annotation_count": len(ann_rows),
+        },
+        "segments": result["segments"],
+        "exclusions": exclusions,
     }
 
 
