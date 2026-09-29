@@ -342,6 +342,36 @@ ID 列表顺序必然相同。
 计算完全确定：相同快照（同一版本内容、同一批批注位置）与相同请求，
 响应序列化后**字节一致**（与请求中 ID 的排列顺序无关）。
 
+### 文档批注覆盖图
+
+`GET /documents/{id}/versions/{n}/coverage` 只读地给出某一版全文上**每一段
+文本**分别被哪些批注覆盖，适合做覆盖可视化、审阅盲区检查。版本全文与该版
+全部迁移位置在**同一个 SQLite 读事务**（同一快照）中读出，不写入任何数据。
+
+每条批注在该版上归入三类之一：
+
+| 该版生效情况 | 归类 | 说明 |
+|---|---|---|
+| `resolved` / `confirmed` | **definite** | 人工确认过的位置以确认范围为准（状态 `confirmed`） |
+| `ambiguous` 未确认且**非顺延** | **possible** | 先把该批注候选范围中重叠 / 首尾相接的合并为最大区间，再逐个登记；同一 ID 在同一片段只出现一次 |
+| `unresolved` | 不覆盖 | 列入 `exclusions`，原因 `unresolved` |
+| `ambiguous` 顺延占位 | 不覆盖 | 原始歧义未经确认、本版未参与迁移；列入 `exclusions`，原因 `ambiguous_carried` |
+| 该版没有迁移记录 | 不覆盖 | 批注创建于更晚版本；列入 `exclusions`，原因 `location_missing` |
+
+响应 `segments` 把 `[0, 文本码点长度)` 划分为连续、无重叠的**最大片段**
+（空文本也是单个 `[0, 0)` 空片段），每段含：
+
+- `start` / `end`：Unicode 码点半开区间，`text` 为该段原文；
+- `definite_ids` / `possible_ids`：覆盖该段的批注 ID，均**升序去重**；
+- `status`：有 definite → `covered`；没有 definite 但有 possible →
+  `uncertain`；两类都空 → `uncovered`。
+
+**相邻片段仅在状态与两组 ID 完全相同时才合并**，因此首尾相接但批注不同的
+两段仍是两个片段。片段从 0 无缝铺满到文本长度，相邻片段首尾相接，
+`"".join(seg["text"] …)` 可还原全文。`exclusions` 按批注 ID 升序，逐条给出
+`reason` 机器码与中文 `message`。相同快照下响应序列化后**字节一致**。
+文档或版本不存在返回 404。
+
 ### 文档增量事件流
 
 `GET /documents/{id}/events?limit=&cursor=` 把文档的六类**只追加**记录合并为
@@ -421,6 +451,7 @@ ID 列表顺序必然相同。
 | POST | `/documents/{id}/versions` | 提交新版全文，触发全部批注的续接迁移 |
 | GET | `/documents/{id}/versions` | 版本列表 |
 | GET | `/documents/{id}/versions/{n}` | 某版全文及该版全部迁移结果 |
+| GET | `/documents/{id}/versions/{n}/coverage` | 文档批注覆盖图：全文划分为 covered/uncertain/uncovered 最大片段，含 definite/possible 批注 ID 与 exclusions（只读） |
 | GET | `/documents/{id}/compare?from_version=&to_version=` | 任意两版间每条批注的范围、状态与匹配依据 |
 | GET | `/documents/{id}/impact?from_version=&to_version=` | 批注改动影响分析：码点级编辑片段 + 起始版每条批注范围到目标版的投影与分类 |
 | POST | `/documents/{id}/dependencies` | 批量提交审阅依赖关系（整批校验跨文档引用/自依赖/重复边/环，失败则全部不落库） |
@@ -820,6 +851,91 @@ curl -X POST $B/documents/1/redact -H 'Content-Type: application/json' -d '{
 # 5. 只读：脱敏不改变任何数据；相同快照 + 相同请求多次调用结果字节一致。
 ```
 
+文档批注覆盖图示例：
+
+```bash
+B=http://localhost:8000
+
+# 1. 新建文档「目标一，目标二，目标三」（11 个码点），对三个目标各建一条
+#    批注（编号 1/2/3）；提交第 2 版「目标一，目标二X，目标二X」（13 个码点）：
+#    目标一唯一落点 → resolved；目标二两处分数相同 → ambiguous；目标三消失 → unresolved
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "覆盖图示例",
+  "content": "目标一，目标二，目标三"
+}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注一","selection":"目标一","start":0,"end":3}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注二","selection":"目标二","start":4,"end":7}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注三","selection":"目标三","start":8,"end":11}'
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content":"目标一，目标二X，目标二X"}'
+# 第 2 版上再创建一条批注（编号 4，选区为第一个 X [7,8)）
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注四","selection":"X","start":7,"end":8}'
+
+# 2. 第 1 版覆盖图：1/2/3 三段 covered，标点 uncovered；
+#    批注 4 创建于第 2 版 → exclusions（location_missing），不覆盖任何位置
+curl $B/documents/1/versions/1/coverage
+# → {"document_id":1,"version_number":1,"source_length":11,
+#    "summary":{"segment_count":5,"covered":3,"uncertain":0,"uncovered":2,"excluded":1},
+#    "segments":[
+#      {"index":0,"start":0,"end":3,"text":"目标一","definite_ids":[1],"possible_ids":[],"status":"covered"},
+#      {"index":1,"start":3,"end":4,"text":"，","definite_ids":[],"possible_ids":[],"status":"uncovered"},
+#      {"index":2,"start":4,"end":7,"text":"目标二","definite_ids":[2],"possible_ids":[],"status":"covered"},
+#      {"index":3,"start":7,"end":8,"text":"，","definite_ids":[],"possible_ids":[],"status":"uncovered"},
+#      {"index":4,"start":8,"end":11,"text":"目标三","definite_ids":[3],"possible_ids":[],"status":"covered"}],
+#    "exclusions":[{"annotation_id":4,"reason":"location_missing",
+#                   "message":"批注 4 在第 1 版没有迁移记录（该批注创建于更晚版本），不参与覆盖图"}]}
+
+# 3. 第 2 版覆盖图：目标一 covered（1）、两个「目标二」uncertain（possible=2，
+#    同一 ID 各出现一次）、第一个 X covered（4）、末尾 X uncovered；批注 3 排除
+curl $B/documents/1/versions/2/coverage
+# → {"version_number":2,"source_length":13,
+#    "summary":{"segment_count":7,"covered":2,"uncertain":2,"uncovered":3,"excluded":1},
+#    "segments":[
+#      {"index":0,"start":0,"end":3,"text":"目标一","definite_ids":[1],"possible_ids":[],"status":"covered"},
+#      {"index":1,"start":3,"end":4,"text":"，",    "definite_ids":[],"possible_ids":[],"status":"uncovered"},
+#      {"index":2,"start":4,"end":7,"text":"目标二","definite_ids":[],"possible_ids":[2],"status":"uncertain"},
+#      {"index":3,"start":7,"end":8,"text":"X",    "definite_ids":[4],"possible_ids":[],"status":"covered"},
+#      {"index":4,"start":8,"end":9,"text":"，",    "definite_ids":[],"possible_ids":[],"status":"uncovered"},
+#      {"index":5,"start":9,"end":12,"text":"目标二","definite_ids":[],"possible_ids":[2],"status":"uncertain"},
+#      {"index":6,"start":12,"end":13,"text":"X",  "definite_ids":[],"possible_ids":[],"status":"uncovered"}],
+#    "exclusions":[{"annotation_id":3,"reason":"unresolved",
+#                   "message":"批注 3 在第 2 版未解析（选区在该版没有精确落点），不提供范围"}]}
+
+# 4. 歧义未确认时先提交第 3 版 → 顺延占位：批注 2 在该版不参与迁移、
+#    不提供任何范围，exclusions 原因为 ambiguous_carried（没有 uncertain 片段）
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content":"全新的一版：目标一，没有别的目标。"}'
+curl $B/documents/1/versions/3/coverage
+# → 全文仅「目标一」一段 covered；没有 uncertain 片段
+#   exclusions: [
+#     {"annotation_id":2,"reason":"ambiguous_carried", ...},
+#     {"annotation_id":3,"reason":"unresolved", ...},
+#     {"annotation_id":4,"reason":"unresolved", ...}]
+
+# 5. 人工确认批注 2 在第 2 版的候选 [4,7)：该版覆盖图中该段升为 covered
+#    （definite_ids=[2]），未选中的 [9,12) 不再是 possible；
+#    已顺延过的第 3 版不追溯赋予范围，仍为 ambiguous_carried
+curl -X POST $B/documents/1/annotations/2/confirmations \
+  -H 'Content-Type: application/json' -d \
+  '{"version_number":2,"start":4,"end":7}'
+curl $B/documents/1/versions/2/coverage
+# → segments:
+#     [0,3)  目标一  covered   definite=[1]
+#     [3,4)  ，      uncovered
+#     [4,7)  目标二  covered   definite=[2]
+#     [7,8)  X       covered   definite=[4]（该批注不受批注 2 确认影响）
+#     [8,13) ，目标二X uncovered（原 possible 的另一候选已被确认结果排除，
+#                                 与相邻 uncovered 合并为最大片段）
+#   exclusions 中不再出现批注 2
+
+# 6. 只读且确定：segments 从 0 无缝铺满 source_length，"".join(text) 还原全文；
+#    相同快照多次调用响应字节一致。
+```
+
 文档增量事件流示例（**首轮 → 分页 → 续拉**）：
 
 ```bash
@@ -909,10 +1025,11 @@ curl "$B/documents/2/events?cursor=eyJ2IjoxLCJraW5kIjoicmVzdW1l...文档1的游�
 
 ```
 app/
-  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、增量事件接口）
+  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件接口）
   matching.py   # 锚点匹配核心（枚举落点、上下文打分、排序判定）
   diffing.py    # 两版全文的码点级编辑片段、范围投影与分类（纯函数）
   redacting.py  # 脱敏副本：生效范围合并为最大区间、按起点替换与源/结果码点区间映射（纯函数）
+  coverage.py   # 批注覆盖图：候选合并与扫描线切片为 covered/uncertain/uncovered 最大片段（纯函数）
   review.py     # 审阅依赖图算法：环检测、传递前置、拓扑分层（纯函数）
   gate.py       # 发布门禁策略树：语法校验（深度/节点数/枚举域）与快照评估、同形解释树（纯函数）
   events.py     # 文档增量事件流：六表水位向量、(created_at, type_rank, id) 稳定合并、续页/续拉游标编解码
@@ -927,6 +1044,7 @@ tests/
   test_review.py    # 审阅依赖编排测试（依赖校验/环检测/审阅计划/完成记录）
   test_gate.py      # 发布门禁测试（策略语法拒绝/修订只追加/同事务快照评估/不短路解释树/稳定性）
   test_redacting.py # 批注驱动脱敏测试（范围合并/首尾相接/码点映射/整批可定位错误/字节稳定性/只读）
+  test_coverage.py  # 批注覆盖图测试（候选合并/扫描线最大片段/definite优先/空区间/无缝铺满/顺延与确认/字节稳定性/只读）
   test_events.py    # 增量事件流测试（首轮六类合并/续页分页不漏不重/并发新增留到下一轮/续拉增量/空轮推进/游标422）
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
 Dockerfile

@@ -37,6 +37,12 @@
   键，只读取 (起点, 终点] 且始终沿用终点水位（并发新增留到下一轮），
   末页返回 resume_cursor 续拉增量，空轮也推进水位；游标版本、结构、范围
   错误或跨文档使用返回 422；事件载荷只保留行落库时的稳定业务字段。
+- 文档批注覆盖图：指定文档版本，在同一个 SQLite 读事务中读取该版全文与
+  全部迁移位置，把 [0, 文本码点长度) 划分为连续、无重叠的最大片段；
+  resolved / confirmed 计入 definite，未确认且非顺延的 ambiguous 先按批注
+  合并重叠候选再计入 possible（同一 ID 不重复），unresolved、顺延占位与
+  该版尚不存在的批注列入 exclusions；片段状态 covered / uncertain /
+  uncovered 无缝铺满全文，接口只读、相同快照字节一致。
 """
 from __future__ import annotations
 
@@ -57,6 +63,15 @@ from .diffing import (
     compute_segments,
     hit_segment_indices,
     project_range,
+)
+from .coverage import (
+    AmbiguousRange,
+    DefiniteRange,
+    Exclusion,
+    REASON_AMBIGUOUS_CARRIED,
+    REASON_LOCATION_MISSING,
+    REASON_UNRESOLVED,
+    build_coverage,
 )
 from .matching import locate
 from .redacting import EffectiveRange, build_redaction, merge_ranges
@@ -87,7 +102,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -100,7 +115,9 @@ app = FastAPI(
         "以及批注驱动的脱敏副本：同一读事务读取版本与生效位置，"
         "重叠或首尾相接的范围合并替换，返回脱敏全文与码点区间映射；"
         "以及文档增量事件流：六类只追加记录稳定合并，以水位向量 + "
-        "续页 / 续拉游标分页，窗口内不漏、不重、不乱序。"
+        "续页 / 续拉游标分页，窗口内不漏、不重、不乱序；"
+        "以及文档批注覆盖图：同一读事务读取版本全文与全部迁移位置，"
+        "把全文划分为 covered / uncertain / uncovered 最大片段并无缝铺满。"
     ),
     lifespan=lifespan,
 )
@@ -242,7 +259,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -338,6 +355,126 @@ def get_version(document_id: int, number: int, con=Depends(get_db)):
         "content": v["content"],
         "created_at": v["created_at"],
         "locations": [_location_out(con, loc) for loc in locs],
+    }
+
+
+@app.get("/documents/{document_id}/versions/{number}/coverage")
+def version_coverage(document_id: int, number: int, con=Depends(get_db)):
+    """文档批注覆盖图：把该版全文划分为连续、无重叠的最大片段（只读）。
+
+    版本全文与该版全部批注的迁移位置在**同一个 SQLite 读事务**（同一快照）
+    中读出，接口不写入任何数据。分类规则：
+
+    - ``resolved`` / ``confirmed``（人工确认以确认范围为准）→ **definite**；
+    - 未确认且**非顺延**的 ``ambiguous``：先按批注把候选范围中重叠 / 首尾
+      相接的合并为最大区间，再作为 **possible** 登记（同一 ID 不重复）；
+    - ``unresolved``、歧义顺延占位、该版尚不存在迁移记录（批注创建于更晚
+      版本）的批注不覆盖任何位置，列入 ``exclusions`` 并说明原因。
+
+    每个片段返回 ``[start, end)``、``text``、升序的 ``definite_ids`` /
+    ``possible_ids`` 与 ``status``：有 definite 为 ``covered``，仅有 possible
+    为 ``uncertain``，均空为 ``uncovered``。相邻片段仅在状态与两组 ID 完全
+    相同时合并。片段从 0 无缝铺满到文本码点长度（空文本为单个空片段）。
+    相同快照下结果序列化后字节一致。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        version = _get_version(con, document_id, number)
+        text = version["content"]
+
+        anns = con.execute(
+            "SELECT id FROM annotations WHERE document_id = ? ORDER BY id",
+            (document_id,),
+        ).fetchall()
+
+        definite: list = []
+        ambiguous: list = []
+        exclusions: list = []
+        for ann_row in anns:
+            annotation_id = ann_row["id"]
+            loc = con.execute(
+                "SELECT * FROM locations WHERE annotation_id = ? AND version_id = ?",
+                (annotation_id, version["id"]),
+            ).fetchone()
+            if loc is None:
+                exclusions.append(
+                    Exclusion(
+                        annotation_id=annotation_id,
+                        reason=REASON_LOCATION_MISSING,
+                        message=(
+                            f"批注 {annotation_id} 在第 {number} 版没有迁移记录"
+                            "（该批注创建于更晚版本），不参与覆盖图"
+                        ),
+                    )
+                )
+                continue
+
+            conf = _confirmation_of(con, loc["id"])
+            if conf is not None:
+                definite.append(
+                    DefiniteRange(annotation_id, conf["start"], conf["end"])
+                )
+            elif loc["status"] == "resolved":
+                definite.append(
+                    DefiniteRange(annotation_id, loc["start"], loc["end"])
+                )
+            elif loc["status"] == "ambiguous":
+                if loc["carried_from"] is not None:
+                    exclusions.append(
+                        Exclusion(
+                            annotation_id=annotation_id,
+                            reason=REASON_AMBIGUOUS_CARRIED,
+                            message=(
+                                f"批注 {annotation_id} 在第 {number} 版为歧义顺延"
+                                "占位记录（原始歧义未经人工确认），不提供范围"
+                            ),
+                        )
+                    )
+                else:
+                    candidates = tuple(
+                        (c["start"], c["end"])
+                        for c in json.loads(loc["candidates"])
+                    )
+                    ambiguous.append(
+                        AmbiguousRange(
+                            annotation_id=annotation_id, candidates=candidates
+                        )
+                    )
+            else:  # unresolved
+                exclusions.append(
+                    Exclusion(
+                        annotation_id=annotation_id,
+                        reason=REASON_UNRESOLVED,
+                        message=(
+                            f"批注 {annotation_id} 在第 {number} 版未解析"
+                            "（选区在该版没有精确落点），不提供范围"
+                        ),
+                    )
+                )
+
+        coverage = build_coverage(text, definite, ambiguous)
+        segments = coverage["segments"]
+
+    return {
+        "document_id": document_id,
+        "version_number": number,
+        "source_length": len(text),
+        "summary": {
+            "segment_count": len(segments),
+            "covered": sum(1 for s in segments if s["status"] == "covered"),
+            "uncertain": sum(1 for s in segments if s["status"] == "uncertain"),
+            "uncovered": sum(1 for s in segments if s["status"] == "uncovered"),
+            "excluded": len(exclusions),
+        },
+        "segments": segments,
+        "exclusions": [
+            {
+                "annotation_id": e.annotation_id,
+                "reason": e.reason,
+                "message": e.message,
+            }
+            for e in exclusions
+        ],
     }
 
 
